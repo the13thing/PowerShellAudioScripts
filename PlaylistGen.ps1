@@ -2,7 +2,7 @@
 PlaylistGen.ps1
 --------------------------
 Searches for audio files based on a CSV file containing song names and artists,
-creates a playlist from found matches using fuzzy string matching.
+or creates a playlist from all audio files in a folder (recursive search).
 
 The CSV should have format: "song name, artist name"
 
@@ -13,14 +13,18 @@ Supports:
     - Fuzzy matching for song titles (default 50% threshold)
     - Multiple playlist formats (M3U, PLS, WPL)
     - Relative or absolute file paths in playlists
+    - All files mode (recursive folder search when no CSV specified)
 
 Usage examples:
 ---------------
-# Fully automated with relative paths
+# Fully automated with CSV and relative paths
 .\PlaylistGen.ps1 -Src "D:\Music" -Dest "E:\Playlists" -CsvSrc "songs.csv" -ArtistThreshold 80 -SongThreshold 50 -PathType "Relative"
 
 # With absolute paths for better compatibility
 .\PlaylistGen.ps1 -Src "D:\Music" -Dest "E:\Playlists" -CsvSrc "songs.csv" -PathType "Absolute"
+
+# Include all audio files (no CSV needed)
+.\PlaylistGen.ps1 -Src "D:\Music" -Dest "E:\Playlists" -AllFiles
 
 # Interactive (if you omit params)
 .\PlaylistGen.ps1
@@ -35,7 +39,8 @@ param(
     [string]$PlaylistFormat = "M3U",
     [string]$PlaylistName = "GeneratedPlaylist",
     [string]$PathType = "Relative",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$AllFiles
 )
 
 # ------------------------------
@@ -43,7 +48,17 @@ param(
 # ------------------------------
 if (-not $Src) { $Src = (Get-Location).Path }
 if (-not $Dest) { $Dest = (Get-Location).Path }
-if (-not $CsvSrc) { $CsvSrc = Join-Path (Get-Location).Path "addToPlaylist.csv" }
+
+# If no CsvSrc specified or empty string, we'll generate playlist with all audio files
+if ([string]::IsNullOrWhiteSpace($CsvSrc)) { 
+    $AllFiles = $true
+    $CsvSrc = $null
+} else {
+    # Default CSV path if only directory specified
+    if (Test-Path $CsvSrc -PathType Container) {
+        $CsvSrc = Join-Path $CsvSrc "addToPlaylist.csv"
+    }
+}
 
 $allowedFormats = @("M3U", "PLS", "WPL")
 if (-not $allowedFormats -contains $PlaylistFormat.ToUpper()) {
@@ -71,10 +86,20 @@ if (-not $PSBoundParameters.Count) {
     $Dest = Read-Host "Enter the destination folder for playlist (default = current folder)"
     if (-not $Dest) { $Dest = (Get-Location).Path }
 
-    $CsvSrc = Read-Host "Enter the CSV file path (default = addToPlaylist.csv in current folder)"
-    if (-not $CsvSrc) { $CsvSrc = Join-Path (Get-Location).Path "addToPlaylist.csv" }
-    while (-not (Test-Path $CsvSrc)) {
-        $CsvSrc = Read-Host "Invalid CSV file. Enter a valid file path"
+    Write-Host "`nPlaylist source:"
+    Write-Host "1: Use CSV file with specific songs"
+    Write-Host "2: Include all audio files in source folder (recursive)"
+    $sourceChoice = Read-Host "Enter choice (1-2)"
+    
+    if ($sourceChoice -eq "2") {
+        $AllFiles = $true
+        $CsvSrc = $null
+    } else {
+        $CsvSrc = Read-Host "Enter the CSV file path (default = addToPlaylist.csv in current folder)"
+        if (-not $CsvSrc) { $CsvSrc = Join-Path (Get-Location).Path "addToPlaylist.csv" }
+        while (-not (Test-Path $CsvSrc)) {
+            $CsvSrc = Read-Host "Invalid CSV file. Enter a valid file path"
+        }
     }
 
     $ArtistThreshold = Read-Host "Artist name matching threshold percentage (default = 80)"
@@ -117,7 +142,11 @@ $audioExtensions = @(".flac", ".mp3", ".wav", ".aac", ".ogg", ".wma")
 Write-Host "`nConfiguration:"
 Write-Host "Source music folder: $Src"
 Write-Host "Destination folder: $Dest"
-Write-Host "CSV file: $CsvSrc"
+if ($AllFiles) {
+    Write-Host "Mode: All audio files (recursive)"
+} else {
+    Write-Host "CSV file: $CsvSrc"
+}
 Write-Host "Artist matching threshold: $ArtistThreshold%"
 Write-Host "Song matching threshold: $SongThreshold%"
 Write-Host "Playlist format: $PlaylistFormat"
@@ -194,6 +223,11 @@ function Get-AudioMetadata {
         Album = ""
     }
     
+    # Validate input path
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $metadata
+    }
+    
     try {
         # Try to get metadata using ffprobe
         if (Get-Command "ffprobe" -ErrorAction SilentlyContinue) {
@@ -211,10 +245,24 @@ function Get-AudioMetadata {
     
     # Fallback to folder/filename if metadata is empty
     if (-not $metadata.Artist) {
-        $metadata.Artist = Split-Path (Split-Path $Path -Parent) -Leaf
+        try {
+            $parentDir = Split-Path $Path -Parent -ErrorAction SilentlyContinue
+            if ($parentDir) {
+                $metadata.Artist = Split-Path $parentDir -Leaf -ErrorAction SilentlyContinue
+            }
+            if (-not $metadata.Artist) {
+                $metadata.Artist = "Unknown Artist"
+            }
+        } catch {
+            $metadata.Artist = "Unknown Artist"
+        }
     }
     if (-not $metadata.Title) {
-        $metadata.Title = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+        try {
+            $metadata.Title = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+        } catch {
+            $metadata.Title = "Unknown Title"
+        }
     }
     
     return $metadata
@@ -227,10 +275,19 @@ function Get-PlaylistPath {
         [string]$PathType
     )
     
+    # Validate input parameters
+    if ([string]::IsNullOrWhiteSpace($FilePath)) {
+        return ""
+    }
+    
     if ($PathType -eq "Absolute") {
         return $FilePath
     } else {
         # Return relative path from source directory
+        if ([string]::IsNullOrWhiteSpace($SourcePath)) {
+            return $FilePath
+        }
+        
         if ($FilePath.StartsWith($SourcePath, [StringComparison]::OrdinalIgnoreCase)) {
             $relativePath = $FilePath.Substring($SourcePath.Length).TrimStart('\', '/')
             return $relativePath
@@ -346,7 +403,7 @@ if (-not (Test-Path $Src)) {
     exit 1
 }
 
-if (-not (Test-Path $CsvSrc)) {
+if (-not $AllFiles -and -not [string]::IsNullOrWhiteSpace($CsvSrc) -and -not (Test-Path $CsvSrc)) {
     Write-Error "CSV file not found: $CsvSrc"
     exit 1
 }
@@ -360,59 +417,114 @@ if (-not (Test-Path $Dest)) {
     }
 }
 
-# Read CSV file
-Write-Host "`nReading CSV file..."
-try {
-    $csvData = Import-Csv -Path $CsvSrc -Header "Song", "Artist"
-} catch {
-    Write-Error "Error reading CSV file: $($_.Exception.Message)"
-    exit 1
+# Read CSV file or prepare all files mode
+if ($AllFiles) {
+    Write-Host "`nScanning for all audio files..."
+    
+    # Get all audio files recursively
+    $audioFiles = Get-ChildItem -Path $Src -Recurse -File | Where-Object { 
+        $audioExtensions -contains $_.Extension.ToLower() 
+    }
+    
+    Write-Host "Found $($audioFiles.Count) audio files.`n"
+    
+    # Create virtual CSV data for all files (using filename as both song and artist for compatibility)
+    $csvData = @()
+    foreach ($file in $audioFiles) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $csvData += [PSCustomObject]@{
+            Song = $baseName
+            Artist = ""  # Empty artist for all-files mode
+        }
+    }
+} else {
+    Write-Host "`nReading CSV file..."
+    try {
+        $csvData = Import-Csv -Path $CsvSrc -Header "Song", "Artist"
+    } catch {
+        Write-Error "Error reading CSV file: $($_.Exception.Message)"
+        exit 1
+    }
+    
+    Write-Host "Found $($csvData.Count) songs in CSV file.`n"
 }
-
-Write-Host "Found $($csvData.Count) songs in CSV file.`n"
 
 # Search for matches
 $allMatches = @()
 $foundCount = 0
 $notFoundCount = 0
 
-Write-Host "Searching for matches..."
-Write-Host "========================="
-
-foreach ($entry in $csvData) {
-    $song = $entry.Song.Trim()
-    $artist = $entry.Artist.Trim()
+if ($AllFiles) {
+    Write-Host "Including all audio files..."
+    Write-Host "========================="
     
-    if ([string]::IsNullOrWhiteSpace($song) -or [string]::IsNullOrWhiteSpace($artist)) {
-        continue
+    # For all files mode, create matches directly from the audio files
+    $audioFiles = Get-ChildItem -Path $Src -Recurse -File | Where-Object { 
+        $audioExtensions -contains $_.Extension.ToLower() 
     }
     
-    Write-Host "Searching for: '$song' by '$artist'"
-    
-    # Use script-level variable instead of function return
-    $script:foundMatches = @()
-    Find-MatchingFiles -SourcePath $Src -TargetArtist $artist -TargetSong $song -ArtistThreshold $ArtistThreshold -SongThreshold $SongThreshold
-    
-    if ($script:foundMatches.Count -gt 0) {
-        # Take the best match (highest combined similarity)
-        $bestMatch = $script:foundMatches | Sort-Object { $_.ArtistSimilarity + $_.SongSimilarity } -Descending | Select-Object -First 1
-        $allMatches += $bestMatch
+    foreach ($file in $audioFiles) {
+        $metadata = Get-AudioMetadata -FilePath $file.FullName
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        
+        # Create a match object compatible with the playlist creation
+        $match = [PSCustomObject]@{
+            File = $file
+            Title = if ($metadata.Title) { $metadata.Title } else { $baseName }
+            Artist = if ($metadata.Artist) { $metadata.Artist } else { "Unknown Artist" }
+            ArtistSimilarity = 100  # Perfect match for compatibility
+            SongSimilarity = 100    # Perfect match for compatibility
+        }
+        
+        $allMatches += $match
         $foundCount++
         
-        Write-Host "  ✓ Found: '$($bestMatch.Title)' by '$($bestMatch.Artist)' (Artist: $($bestMatch.ArtistSimilarity)%, Song: $($bestMatch.SongSimilarity)%)" -ForegroundColor Green
-    } else {
-        $notFoundCount++
-        Write-Host "  ✗ No match found" -ForegroundColor Red
+        Write-Host "  ✓ Added: '$($match.Title)' by '$($match.Artist)'" -ForegroundColor Green
+    }
+} else {
+    Write-Host "Searching for matches..."
+    Write-Host "========================="
+
+    foreach ($entry in $csvData) {
+        $song = $entry.Song.Trim()
+        $artist = $entry.Artist.Trim()
+        
+        if ([string]::IsNullOrWhiteSpace($song) -or [string]::IsNullOrWhiteSpace($artist)) {
+            continue
+        }
+        
+        Write-Host "Searching for: '$song' by '$artist'"
+        
+        # Use script-level variable instead of function return
+        $script:foundMatches = @()
+        Find-MatchingFiles -SourcePath $Src -TargetArtist $artist -TargetSong $song -ArtistThreshold $ArtistThreshold -SongThreshold $SongThreshold
+        
+        if ($script:foundMatches.Count -gt 0) {
+            # Take the best match (highest combined similarity)
+            $bestMatch = $script:foundMatches | Sort-Object { $_.ArtistSimilarity + $_.SongSimilarity } -Descending | Select-Object -First 1
+            $allMatches += $bestMatch
+            $foundCount++
+            
+            Write-Host "  ✓ Found: '$($bestMatch.Title)' by '$($bestMatch.Artist)' (Artist: $($bestMatch.ArtistSimilarity)%, Song: $($bestMatch.SongSimilarity)%)" -ForegroundColor Green
+        } else {
+            $notFoundCount++
+            Write-Host "  ✗ No match found" -ForegroundColor Red
+        }
     }
 }
 
 # Results summary
 Write-Host "`n========================="
-Write-Host "Search Summary:"
-Write-Host "Total songs searched: $($csvData.Count)"
-Write-Host "Matches found: $foundCount" -ForegroundColor Green
-Write-Host "Not found: $notFoundCount" -ForegroundColor Red
-Write-Host "Success rate: $([Math]::Round(($foundCount / $csvData.Count) * 100, 1))%"
+if ($AllFiles) {
+    Write-Host "Summary:"
+    Write-Host "Total audio files found: $foundCount" -ForegroundColor Green
+} else {
+    Write-Host "Search Summary:"
+    Write-Host "Total songs searched: $($csvData.Count)"
+    Write-Host "Matches found: $foundCount" -ForegroundColor Green
+    Write-Host "Not found: $notFoundCount" -ForegroundColor Red
+    Write-Host "Success rate: $([Math]::Round(($foundCount / $csvData.Count) * 100, 1))%"
+}
 
 # Create playlist
 if ($allMatches.Count -gt 0 -and -not $DryRun) {
@@ -444,7 +556,11 @@ if ($allMatches.Count -gt 0 -and -not $DryRun) {
 $commandArgs = @()
 $commandArgs += "-Src '$Src'"
 $commandArgs += "-Dest '$Dest'"
-$commandArgs += "-CsvSrc '$CsvSrc'"
+if ($AllFiles) {
+    $commandArgs += "-AllFiles"
+} else {
+    $commandArgs += "-CsvSrc '$CsvSrc'"
+}
 $commandArgs += "-ArtistThreshold $ArtistThreshold"
 $commandArgs += "-SongThreshold $SongThreshold"
 $commandArgs += "-PlaylistFormat '$PlaylistFormat'"
